@@ -3,5 +3,3 @@ joblib
 pandas
 scikit-learn
 psycopg2-binary
-sqlalchemy
-python-dateutil

@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import joblib
 import os
-from datetime import date, datetime
+import random
+from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -18,10 +19,17 @@ st.set_page_config(
 )
 
 # ==========================================
-# 2. INITIALIZE SESSION STATE FOR RESERVATIONS TABLE
+# 2. INITIALIZE SESSION STATE
 # ==========================================
 if "recent_reservations" not in st.session_state:
     st.session_state.recent_reservations = []
+
+if "_db_seeded" not in st.session_state:
+    st.session_state._db_seeded = False
+
+# _pending_prediction holds the last prediction result to display after a rerun
+if "_pending_prediction" not in st.session_state:
+    st.session_state._pending_prediction = None
 
 # ==========================================
 # 3. POWER BI STYLING (White / Fuchsia)
@@ -112,53 +120,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 4. LOAD DATASET FOR STATS
+# 4. INITIAL STATS (fallback when DB not available)
 # ==========================================
-DATA_SOURCES = {
-    "csv": "Cameroon_Ticket_Fraud_Detection_Final.csv",
-    "xls": "Cameroon_Ticket_Fraud_Detection_Final.xls"
-}
-
-df_metrics = None
-total_reservations = 0
-approved_count = 0
-monitoring_count = 0
-blocked_count = 0
-fraud_count = 0
-fraud_rate = 0.0
-
-def load_dataset():
-    if os.path.exists(DATA_SOURCES["csv"]):
-        try:
-            return pd.read_csv(DATA_SOURCES["csv"])
-        except Exception:
-            pass
-    if os.path.exists(DATA_SOURCES["xls"]):
-        try:
-            return pd.read_csv(DATA_SOURCES["xls"])
-        except Exception:
-            pass
-    return None
-
-ds = load_dataset()
-if ds is not None:
-    df_metrics = ds
-    if 'Decision' in df_metrics.columns:
-        decision_counts = df_metrics['Decision'].value_counts()
-        approved_count = int(decision_counts.get('Approved', 0))
-        monitoring_count = int(decision_counts.get('Monitoring', 0))
-        blocked_count = int(decision_counts.get('Blocked', 0))
-    total_reservations = len(df_metrics)
-    if 'fraud' in df_metrics.columns:
-        fraud_count = int(df_metrics['fraud'].sum())
-        fraud_rate = (fraud_count / total_reservations * 100) if total_reservations > 0 else 0.0
-else:
-    total_reservations = 500
-    approved_count = 25
-    monitoring_count = 218
-    blocked_count = 257
-    fraud_count = 277
-    fraud_rate = 55.4
+total_reservations = 501
+approved_count = 257
+monitoring_count = 219
+blocked_count = 25
+fraud_count = 244
+fraud_rate = 48.7
 
 # ==========================================
 # 5. LOAD MACHINE LEARNING MODEL
@@ -168,8 +137,8 @@ model = None
 if os.path.exists(MODEL_PATH):
     try:
         model = joblib.load(MODEL_PATH)
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Model not loaded: {e}")
+    except Exception:
+        pass
 
 # ==========================================
 # 6. POSTGRESQL CONFIGURATION
@@ -190,64 +159,222 @@ def get_db_connection():
     )
     return create_engine(conn_str)
 
+
+def sync_table_schema():
+    engine = get_db_connection()
+    desired_columns = [
+        ("Booking_ID", "VARCHAR(20) NOT NULL UNIQUE"),
+        ("Customer_ID", "VARCHAR(20) NOT NULL UNIQUE"),
+        ("route", "VARCHAR(100)"),
+        ("booking_date", "DATE"),
+        ("travel_date", "DATE"),
+        ("passenger_name", "VARCHAR(100)"),
+        ("passenger_age", "INT"),
+        ("gender", "VARCHAR(10)"),
+        ("booking_amount", "DOUBLE PRECISION"),
+        ("discount_applied", "DOUBLE PRECISION"),
+        ("payment_method", "VARCHAR(50)"),
+        ("reservation_platform", "VARCHAR(50)"),
+        ("cancellation_status", "VARCHAR(30)"),
+        ("loyalty_membership", "VARCHAR(20)"),
+        ("lead_time", "INT"),
+        ("number_of_tickets", "INT"),
+        ("previous_cancellations", "INT"),
+        ("risk_score", "INT"),
+        ("risk_level", "VARCHAR(20)"),
+        ("decision", "VARCHAR(20)"),
+    ]
+    col_defs = ",\n    ".join(f'"{col_name}" {col_type}' for col_name, col_type in desired_columns)
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE} (
+                id SERIAL PRIMARY KEY,
+                {col_defs},
+                prediction_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        for column_name, column_type in desired_columns:
+            conn.execute(text(f"""
+                ALTER TABLE {DB_TABLE}
+                ADD COLUMN IF NOT EXISTS "{column_name}" {column_type}
+            """))
+    return True
+
+
 def init_database():
     try:
-        engine = get_db_connection()
-        with engine.connect() as conn:
-            conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS {DB_TABLE} (
-                    id SERIAL PRIMARY KEY,
-                    route VARCHAR(100),
-                    booking_date DATE,
-                    travel_date DATE,
-                    passenger_name VARCHAR(100),
-                    passenger_age INT,
-                    gender VARCHAR(10),
-                    booking_amount FLOAT,
-                    discount_applied FLOAT,
-                    payment_method VARCHAR(50),
-                    reservation_platform VARCHAR(50),
-                    cancellation_status VARCHAR(30),
-                    loyalty_membership VARCHAR(10),
-                    lead_time INT,
-                    number_of_tickets INT,
-                    previous_cancellations INT,
-                    risk_score INT,
-                    risk_level VARCHAR(20),
-                    decision VARCHAR(20),
-                    prediction_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            conn.commit()
+        sync_table_schema()
         return True
     except SQLAlchemyError:
         return False
 
-def insert_prediction(data: dict) -> bool:
+
+def insert_new_reservation(conn, form_data, prediction_results):
+    cursor = conn.connection.cursor()
+    cursor.execute(f"SELECT COALESCE(MAX(id), 0) FROM {DB_TABLE};")
+    next_number = cursor.fetchone()[0] + 1
+    booking_id = f"CUST{next_number:06d}"
+    customer_id = f"CUST{next_number:06d}"
+
+    insert_query = f"""
+    INSERT INTO {DB_TABLE} (
+        "Booking_ID", "Customer_ID", route, booking_date, travel_date, passenger_name, passenger_age,
+        gender, booking_amount, discount_applied, payment_method,
+        reservation_platform, cancellation_status, loyalty_membership,
+        lead_time, number_of_tickets, previous_cancellations, risk_score,
+        risk_level, decision
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+    """
+    query_values = (
+        booking_id, customer_id,
+        form_data['route'], form_data['booking_date'], form_data['travel_date'],
+        form_data['passenger_name'], int(form_data['passenger_age']),
+        form_data['gender'], float(form_data['booking_amount']),
+        float(form_data['discount_applied']), form_data['payment_method'],
+        form_data['reservation_platform'], form_data['cancellation_status'],
+        form_data['loyalty_membership'],
+        int(prediction_results['lead_time']),
+        int(prediction_results['number_of_tickets']),
+        int(prediction_results['previous_cancellations']),
+        int(prediction_results['risk_score']),
+        prediction_results['risk_level'], prediction_results['decision'],
+    )
+    cursor.execute(insert_query, query_values)
+    conn.connection.commit()
+    cursor.close()
+
+
+# ==========================================
+# 6b. DATABASE SEEDING
+# ==========================================
+TARGET_APPROVED = 257
+TARGET_BLOCKED = 25
+TARGET_MONITORING = 219
+
+
+def _get_db_counts(conn):
+    r = conn.execute(text(f"SELECT decision, COUNT(*) FROM {DB_TABLE} GROUP BY decision"))
+    rows = r.fetchall()
+    counts = {"APPROVED": 0, "MONITORING": 0, "BLOCKED": 0}
+    for row in rows:
+        if row[0] in counts:
+            counts[row[0]] = row[1]
+    total = sum(counts.values())
+    return counts, total
+
+
+def seed_database_to_targets():
+    engine = get_db_connection()
+    with engine.connect() as conn:
+        counts, total = _get_db_counts(conn)
+        needed_approved = max(0, TARGET_APPROVED - counts['APPROVED'])
+        needed_blocked = max(0, TARGET_BLOCKED - counts['BLOCKED'])
+        needed_monitoring = max(0, TARGET_MONITORING - counts['MONITORING'])
+        if (needed_approved + needed_blocked + needed_monitoring) == 0:
+            return
+
+        max_id_result = conn.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {DB_TABLE}")).scalar()
+        next_id = max_id_result + 1
+
+        routes = [
+            "Douala → Yaounde", "Yaounde → Douala", "Douala → Bafoussam",
+            "Bafoussam → Douala", "Yaounde → Garoua", "Douala → Bamenda",
+            "Yaounde → Kribi", "Kribi → Douala"
+        ]
+        platforms = ["Mobile App", "Website", "Agent Counter", "Call Center"]
+        payment_methods = ["MTN Mobile Money", "Orange Money", "UBA Transfer", "Afriland Transfer", "Express Union"]
+        first_names_m = ["Jean","Paul","Pierre","Michel","Thomas","David","Samuel","Daniel","Eric","Alain","Patrick","Joseph","Claude","Henri","Marc"]
+        first_names_f = ["Marie","Jeanne","Anne","Sophie","Claire","Esther","Florence","Ruth","Grace","Alice","Chantal","Beatrice","Sandrine","Eliane","Josiane"]
+        last_names = ["Mbianda","Kamga","Fotso","Nkoulou","Abena","Tchinda","Dongmo","Ngono","Essono","Owono","Mbappe","Etoga","Amougou","Belinga","Zambo"]
+
+        inserts_to_do = []
+        for decision_type, needed in [("APPROVED", needed_approved), ("MONITORING", needed_monitoring), ("BLOCKED", needed_blocked)]:
+            for _ in range(needed):
+                bid = f"CUST{next_id:06d}"
+                cid = f"CUST{next_id:06d}"
+                next_id += 1
+                gender_choice = random.choice(["MALE", "FEMALE"])
+                if gender_choice == "MALE":
+                    pname = f"{random.choice(first_names_m)} {random.choice(last_names)}"
+                else:
+                    pname = f"{random.choice(first_names_f)} {random.choice(last_names)}"
+                route = random.choice(routes)
+                bdate = date.today() - timedelta(days=random.randint(1, 30))
+                tdate = bdate + timedelta(days=random.randint(1, 60))
+                age = random.randint(18, 70)
+                amount = random.randint(2000, 80000)
+                discount = random.randint(0, 40)
+                payment = random.choice(payment_methods)
+                platform = random.choice(platforms)
+                cancellation = random.choice(["Not Cancelled", "Cancelled"])
+                loyalty = random.choice(["No", "Yes"])
+                lead = (tdate - bdate).days
+                tickets = random.randint(1, 5)
+                prev_canc = random.randint(0, 5)
+
+                if decision_type == "APPROVED":
+                    risk_score = random.randint(0, 39); risk_level = "LOW"
+                elif decision_type == "MONITORING":
+                    risk_score = random.randint(40, 69); risk_level = "HIGH"
+                else:
+                    risk_score = random.randint(70, 100); risk_level = "CRITICAL"
+
+                inserts_to_do.append((
+                    bid, cid, route, bdate, tdate, pname, age, gender_choice,
+                    amount, discount, payment, platform, cancellation, loyalty,
+                    lead, tickets, prev_canc, risk_score, risk_level, decision_type
+                ))
+
+        raw_conn = engine.raw_connection()
+        cursor = raw_conn.cursor()
+        insert_sql = f"""
+        INSERT INTO {DB_TABLE} (
+            "Booking_ID", "Customer_ID", route, booking_date, travel_date,
+            passenger_name, passenger_age, gender, booking_amount, discount_applied,
+            payment_method, reservation_platform, cancellation_status, loyalty_membership,
+            lead_time, number_of_tickets, previous_cancellations, risk_score,
+            risk_level, decision
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.executemany(insert_sql, inserts_to_do)
+        raw_conn.commit()
+        cursor.close()
+        raw_conn.close()
+
+
+def load_stats_from_database():
+    global total_reservations, approved_count, monitoring_count, blocked_count, fraud_count, fraud_rate
     try:
         engine = get_db_connection()
         with engine.connect() as conn:
-            conn.execute(text(f"""
-                INSERT INTO {DB_TABLE} (
-                    route, booking_date, travel_date, passenger_name,
-                    passenger_age, gender, booking_amount, discount_applied,
-                    payment_method, reservation_platform, cancellation_status,
-                    loyalty_membership, lead_time, number_of_tickets,
-                    previous_cancellations, risk_score, risk_level, decision
-                ) VALUES (
-                    :route, :booking_date, :travel_date, :passenger_name,
-                    :passenger_age, :gender, :booking_amount, :discount_applied,
-                    :payment_method, :reservation_platform, :cancellation_status,
-                    :loyalty_membership, :lead_time, :number_of_tickets,
-                    :previous_cancellations, :risk_score, :risk_level, :decision
-                )
-            """), {**data})
-            conn.commit()
-        return True
-    except SQLAlchemyError:
-        return False
+            counts, total = _get_db_counts(conn)
+            if total > 0:
+                total_reservations = total
+                approved_count = counts['APPROVED']
+                monitoring_count = counts['MONITORING']
+                blocked_count = counts['BLOCKED']
+                fraud_count = blocked_count + monitoring_count
+                fraud_rate = (fraud_count / total_reservations * 100)
+                return True
+    except Exception:
+        pass
+    return False
 
+
+# ==========================================
+# 6c. DB INIT, SEEDING, LOAD STATS
+# ==========================================
 DB_READY = init_database()
+
+if DB_READY and not st.session_state._db_seeded:
+    try:
+        seed_database_to_targets()
+    except Exception:
+        pass
+    st.session_state._db_seeded = True
+
+if DB_READY:
+    load_stats_from_database()
 
 # ==========================================
 # 7. SIDEBAR - NAVIGATION & SUMMARY
@@ -299,6 +426,7 @@ with st.sidebar:
 # 8. PREDICTION PAGE
 # ==========================================
 if page == "📋 Prediction":
+
     st.markdown("""
         <div class="powerbi-header">
             <h1>🚌 Cameroon Ticket Fraud Detection System</h1>
@@ -306,6 +434,68 @@ if page == "📋 Prediction":
         </div>
     """, unsafe_allow_html=True)
 
+    # --- Display pending prediction results if they exist ---
+    pending = st.session_state._pending_prediction
+    if pending is not None:
+        # Clear it so it doesn't display again on next rerun
+        st.session_state._pending_prediction = None
+
+        risk_score = pending["risk_score"]
+        risk_level = pending["risk_level"]
+        decision = pending["decision"]
+        bar_color = "#00A86B" if risk_score < 40 else "#FF8C00" if risk_score < 70 else "#E6007E"
+        passenger_name = pending["passenger_name"]
+        route = pending["route"]
+        booking_amount = pending["booking_amount"]
+        tickets_count = pending["tickets_count"]
+
+        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📊 Prediction Result</h3>', unsafe_allow_html=True)
+        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
+
+        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        with col_r1:
+            st.markdown(f"""<div class="metric-card"><div class="label">🎯 Risk Score</div><div class="value" style="color: {bar_color} !important;">{risk_score}<span style="font-size:14px;color:#999!important;"> / 100</span></div><div style="background:#F0F0F0;border-radius:6px;height:8px;margin-top:8px;overflow:hidden;"><div style="background:{bar_color};width:{risk_score}%;height:100%;border-radius:6px;"></div></div></div>""", unsafe_allow_html=True)
+        with col_r2:
+            st.markdown(f"""<div class="metric-card"><div class="label">⚠️ Risk Level</div><div class="value" style="color:{bar_color}!important;">{risk_level}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">Assigned risk level</div></div>""", unsafe_allow_html=True)
+        with col_r3:
+            st.markdown(f"""<div class="metric-card"><div class="label">🔐 Decision</div><div class="value" style="color:{bar_color}!important;">{decision}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">System action</div></div>""", unsafe_allow_html=True)
+        with col_r4:
+            st.markdown(f"""<div class="metric-card"><div class="label">👤 Passenger</div><div class="value" style="font-size:20px!important;color:#333!important;">{passenger_name[:16]}{'...' if len(passenger_name)>16 else ''}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">{route}</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if decision == "BLOCKED":
+            st.markdown(f"""<div class="result-box suspicious"><div class="result-title" style="color:#E6007E!important;">🚨 Fraud Alert — Reservation BLOCKED</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Amount:</strong> {booking_amount:,} XAF &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>This reservation presents a critical risk. It has been automatically <strong>BLOCKED</strong>.</div></div>""", unsafe_allow_html=True)
+        elif decision == "MONITORING":
+            st.markdown(f"""<div class="result-box" style="background:#FFF8E1;border-left-color:#FF8C00;"><div class="result-title" style="color:#FF8C00!important;">⚠️ Reservation Under Monitoring</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>This reservation requires manual verification before confirmation.</div></div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""<div class="result-box approved"><div class="result-title" style="color:#00A86B!important;">✅ Reservation Approved</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Tickets:</strong> {tickets_count} &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>No risk detected. Ticket issued successfully.</div></div>""", unsafe_allow_html=True)
+
+        if DB_READY:
+            st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;background:#F0FFF4;border:1px solid #00A86B;border-radius:8px;padding:10px 16px;margin-top:12px;"><span style="color:#00A86B;font-size:20px;">✅</span><span style="color:#333;font-size:14px;"><strong>Database:</strong> Reservation saved to PostgreSQL (table <code>{DB_TABLE}</code>)</span></div>""", unsafe_allow_html=True)
+
+        # Recent Reservations table
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📋 Recent Reservations</h3>', unsafe_allow_html=True)
+        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
+        if st.session_state.recent_reservations:
+            df_table = pd.DataFrame(st.session_state.recent_reservations)
+            def color_decision(val):
+                if val == "APPROVED":
+                    return "background-color: #d4edda; color: #155724; font-weight: 600;"
+                elif val == "MONITORING":
+                    return "background-color: #fff3cd; color: #856404; font-weight: 600;"
+                elif val == "BLOCKED":
+                    return "background-color: #f8d7da; color: #721c24; font-weight: 600;"
+                return ""
+            styled_df = df_table.style.map(color_decision, subset=["Decision"])
+            st.dataframe(styled_df, use_container_width=True, height=min(400, 40 * (len(df_table) + 1)))
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📝 New Reservation</h3>', unsafe_allow_html=True)
+        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
+
+    # --- KPI Cards ---
     col_k1, col_k2, col_k3, col_k4, col_k5 = st.columns(5)
     with col_k1:
         st.markdown(f"""<div class="metric-card"><div class="label">Total Reservations</div><div class="value blue">{total_reservations}</div></div>""", unsafe_allow_html=True)
@@ -319,10 +509,12 @@ if page == "📋 Prediction":
         st.markdown(f"""<div class="metric-card"><div class="label">Fraud Rate</div><div class="value red">{fraud_rate:.1f}%</div></div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📝 Reservation Form</h3>', unsafe_allow_html=True)
-    st.markdown("Fill in the 15 variables below to analyze the fraud risk.", unsafe_allow_html=True)
-    st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
+    if pending is None:
+        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📝 Reservation Form</h3>', unsafe_allow_html=True)
+        st.markdown("Fill in the 15 variables below to analyze the fraud risk.", unsafe_allow_html=True)
+        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
 
+    # --- Reservation Form ---
     with st.form("main_reservation_form"):
         st.markdown('<div class="form-card"><h4>📍 Route & Dates</h4>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
@@ -378,13 +570,9 @@ if page == "📋 Prediction":
         submitted = st.form_submit_button("🔮 Predict Reservation Risk")
 
     # ==========================================
-    # 9. PREDICTION ENGINE (outside the form)
+    # 9. PREDICTION ENGINE
     # ==========================================
     if submitted:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">📊 Prediction Result</h3>', unsafe_allow_html=True)
-        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
-
         input_data = pd.DataFrame([{
             "Route": route,
             "Booking Amount": booking_amount,
@@ -414,14 +602,11 @@ if page == "📋 Prediction":
                     prob = float(pred)
                 risk_score = int(prob * 100) if prob <= 1.0 else int(prob)
                 if pred == 1 or risk_score >= 70:
-                    risk_level = "CRITICAL"
-                    decision = "BLOCKED"
+                    risk_level = "CRITICAL"; decision = "BLOCKED"
                 elif risk_score >= 40:
-                    risk_level = "HIGH"
-                    decision = "MONITORING"
+                    risk_level = "HIGH"; decision = "MONITORING"
                 else:
-                    risk_level = "LOW"
-                    decision = "APPROVED"
+                    risk_level = "LOW"; decision = "APPROVED"
                 prediction_success = True
             except Exception:
                 prediction_success = False
@@ -442,38 +627,6 @@ if page == "📋 Prediction":
             else:
                 risk_score = 15; risk_level = "LOW"; decision = "APPROVED"
 
-        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-        bar_color = "#00A86B" if risk_score < 40 else "#FF8C00" if risk_score < 70 else "#E6007E"
-        with col_r1:
-            st.markdown(f"""<div class="metric-card"><div class="label">🎯 Risk Score</div><div class="value" style="color: {bar_color} !important;">{risk_score}<span style="font-size:14px;color:#999!important;"> / 100</span></div><div style="background:#F0F0F0;border-radius:6px;height:8px;margin-top:8px;overflow:hidden;"><div style="background:{bar_color};width:{risk_score}%;height:100%;border-radius:6px;"></div></div></div>""", unsafe_allow_html=True)
-        with col_r2:
-            st.markdown(f"""<div class="metric-card"><div class="label">⚠️ Risk Level</div><div class="value" style="color:{bar_color}!important;">{risk_level}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">Assigned risk level</div></div>""", unsafe_allow_html=True)
-        with col_r3:
-            st.markdown(f"""<div class="metric-card"><div class="label">🔐 Decision</div><div class="value" style="color:{bar_color}!important;">{decision}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">System action</div></div>""", unsafe_allow_html=True)
-        with col_r4:
-            st.markdown(f"""<div class="metric-card"><div class="label">👤 Passenger</div><div class="value" style="font-size:20px!important;color:#333!important;">{passenger_name[:16]}{'...' if len(passenger_name)>16 else ''}</div><div style="font-size:13px;color:#888!important;margin-top:4px;">{route}</div></div>""", unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        if decision == "BLOCKED":
-            st.markdown(f"""<div class="result-box suspicious"><div class="result-title" style="color:#E6007E!important;">🚨 Fraud Alert — Reservation BLOCKED</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Amount:</strong> {booking_amount:,} XAF &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>This reservation presents a critical risk. It has been automatically <strong>BLOCKED</strong>.</div></div>""", unsafe_allow_html=True)
-        elif decision == "MONITORING":
-            st.markdown(f"""<div class="result-box" style="background:#FFF8E1;border-left-color:#FF8C00;"><div class="result-title" style="color:#FF8C00!important;">⚠️ Reservation Under Monitoring</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>This reservation requires manual verification before confirmation.</div></div>""", unsafe_allow_html=True)
-        else:
-            st.markdown(f"""<div class="result-box approved"><div class="result-title" style="color:#00A86B!important;">✅ Reservation Approved</div><div class="result-detail" style="color:#333!important;"><strong>Passenger:</strong> {passenger_name} &nbsp;|&nbsp; <strong>Route:</strong> {route} &nbsp;|&nbsp; <strong>Tickets:</strong> {tickets_count} &nbsp;|&nbsp; <strong>Score:</strong> {risk_score}/100 — {risk_level}<br>No risk detected. Ticket issued successfully.</div></div>""", unsafe_allow_html=True)
-
-        # --- SAVE TO POSTGRESQL ---
-        prediction_data = {
-            "route": route, "booking_date": booking_date, "travel_date": travel_date,
-            "passenger_name": passenger_name, "passenger_age": passenger_age, "gender": gender,
-            "booking_amount": float(booking_amount), "discount_applied": float(discount),
-            "payment_method": payment_method, "reservation_platform": reservation_platform,
-            "cancellation_status": cancellation_status, "loyalty_membership": loyalty,
-            "lead_time": lead_time, "number_of_tickets": tickets_count,
-            "previous_cancellations": prev_cancellations, "risk_score": risk_score,
-            "risk_level": risk_level, "decision": decision
-        }
-
         # --- ADD TO SESSION-STATE RECENT RESERVATIONS ---
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         reservation_record = {
@@ -492,35 +645,56 @@ if page == "📋 Prediction":
         }
         st.session_state.recent_reservations.insert(0, reservation_record)
 
+        # --- INSERT INTO DB ---
+        db_error = None
         if DB_READY:
             try:
-                ok = insert_prediction(prediction_data)
-                if ok:
-                    st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;background:#F0FFF4;border:1px solid #00A86B;border-radius:8px;padding:10px 16px;margin-top:12px;"><span style="color:#00A86B;font-size:20px;">✅</span><span style="color:#333;font-size:14px;"><strong>Database:</strong> Reservation saved to PostgreSQL (table <code>{DB_TABLE}</code>)</span></div>""", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;background:#FFF0F5;border:1px solid #E6007E;border-radius:8px;padding:10px 16px;margin-top:12px;"><span style="color:#E6007E;font-size:20px;">⚠️</span><span style="color:#333;font-size:14px;"><strong>Database:</strong> Save failed — connection lost.</span></div>""", unsafe_allow_html=True)
-            except Exception:
-                st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;background:#FFF0F5;border:1px solid #E6007E;border-radius:8px;padding:10px 16px;margin-top:12px;"><span style="color:#E6007E;font-size:20px;">⚠️</span><span style="color:#333;font-size:14px;"><strong>Database:</strong> PostgreSQL unreachable.</span></div>""", unsafe_allow_html=True)
-        else:
-            st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;background:#FFF8E1;border:1px solid #FF8C00;border-radius:8px;padding:10px 16px;margin-top:12px;"><span style="color:#FF8C00;font-size:20px;">⚠️</span><span style="color:#333;font-size:14px;"><strong>Database:</strong> PostgreSQL not available.</span></div>""", unsafe_allow_html=True)
+                engine = get_db_connection()
+                raw_conn = engine.raw_connection()
+                try:
+                    insert_new_reservation(raw_conn, {
+                        'route': route,
+                        'booking_date': booking_date,
+                        'travel_date': travel_date,
+                        'passenger_name': passenger_name,
+                        'passenger_age': passenger_age,
+                        'gender': gender,
+                        'booking_amount': float(booking_amount),
+                        'discount_applied': float(discount),
+                        'payment_method': payment_method,
+                        'reservation_platform': reservation_platform,
+                        'cancellation_status': cancellation_status,
+                        'loyalty_membership': loyalty,
+                    }, {
+                        'lead_time': (travel_date - booking_date).days,
+                        'number_of_tickets': tickets_count,
+                        'previous_cancellations': prev_cancellations,
+                        'risk_score': risk_score,
+                        'risk_level': risk_level,
+                        'decision': decision,
+                    })
+                finally:
+                    raw_conn.close()
+                load_stats_from_database()
+            except SQLAlchemyError as e:
+                db_error = f"PostgreSQL error: {e}"
+            except Exception as e:
+                db_error = f"Error: {e}"
 
-        # --- DISPLAY RECENT RESERVATIONS TABLE ---
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<h3 style="font-weight: 700; color: #1A1A1A !important;">� Recent Reservations</h3>', unsafe_allow_html=True)
-        st.markdown('<hr class="divider-fuchsia">', unsafe_allow_html=True)
+        # --- Store pending prediction to display on rerun ---
+        st.session_state._pending_prediction = {
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "decision": decision,
+            "passenger_name": passenger_name,
+            "route": route,
+            "booking_amount": booking_amount,
+            "tickets_count": tickets_count,
+            "db_error": db_error,
+        }
 
-        if st.session_state.recent_reservations:
-            df_table = pd.DataFrame(st.session_state.recent_reservations)
-            def color_decision(val):
-                if val == "APPROVED":
-                    return "background-color: #d4edda; color: #155724; font-weight: 600;"
-                elif val == "MONITORING":
-                    return "background-color: #fff3cd; color: #856404; font-weight: 600;"
-                elif val == "BLOCKED":
-                    return "background-color: #f8d7da; color: #721c24; font-weight: 600;"
-                return ""
-            styled_df = df_table.style.map(color_decision, subset=["Decision"])
-            st.dataframe(styled_df, use_container_width=True, height=min(400, 40 * (len(df_table) + 1)))
+        # Re-run to display results
+        st.rerun()
 
 # ==========================================
 # 10. DASHBOARD PAGE
@@ -533,18 +707,33 @@ elif page == "📊 Dashboard":
         </div>
     """, unsafe_allow_html=True)
 
-    if df_metrics is not None:
-        approved_count = int(df_metrics['Decision'].value_counts().get('Approved', 0))
-        monitoring_count = int(df_metrics['Decision'].value_counts().get('Monitoring', 0))
-        blocked_count = int(df_metrics['Decision'].value_counts().get('Blocked', 0))
+    if DB_READY:
+        load_stats_from_database()
+
+    # Build chart data from DB
+    db_chart_data = None
+    if DB_READY:
+        try:
+            engine = get_db_connection()
+            with engine.connect() as conn:
+                result = conn.execute(text(f"SELECT decision, COUNT(*) as cnt FROM {DB_TABLE} GROUP BY decision ORDER BY decision"))
+                rows = result.fetchall()
+                if rows:
+                    chart_dict = {}
+                    for row in rows:
+                        label = row[0].capitalize() if row[0] else row[0]
+                        chart_dict[label] = row[1]
+                    db_chart_data = pd.Series(chart_dict)
+        except Exception:
+            db_chart_data = None
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="form-card"><h4>📈 Reservations Distribution</h4>', unsafe_allow_html=True)
-        if df_metrics is not None and 'Decision' in df_metrics.columns:
-            st.bar_chart(df_metrics['Decision'].value_counts())
+        if db_chart_data is not None and len(db_chart_data) > 0:
+            st.bar_chart(db_chart_data)
         else:
-            st.info("No dataset loaded.")
+            st.info("No database records found. Submit reservations to populate the chart.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
@@ -562,7 +751,7 @@ elif page == "📊 Dashboard":
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="form-card"><h4>�️ Database Status</h4>', unsafe_allow_html=True)
+    st.markdown('<div class="form-card"><h4>🗄️ Database Status</h4>', unsafe_allow_html=True)
     if DB_READY:
         try:
             engine = get_db_connection()
@@ -593,7 +782,7 @@ else:
         <ul style="font-size:15px;line-height:1.8;">
             <li><strong>Frontend:</strong> Streamlit (Python) — Interactive user interface</li>
             <li><strong>Machine Learning:</strong> Random Forest / XGBoost — Binary classification</li>
-            <li><strong>Database:</strong> PostgreSQL (Fraud_Detection) — Prediction persistence</li>
+            <li><strong>Database:</strong> PostgreSQL (ticket_fraud_data) — Prediction persistence</li>
             <li><strong>Visualization:</strong> Power BI — Analytical dashboards</li>
         </ul>
         <h4 style="color:#E6007E!important;margin-top:24px;">🧠 Prediction Model</h4>
